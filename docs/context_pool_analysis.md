@@ -450,6 +450,493 @@ func TestContextCopyShouldNotCancel(t *testing.T) {
 
 ---
 
+## 6.5 http.Request.Context() 取消信号机制深度分析
+
+### 6.5.1 Gin Context 实现了 context.Context 接口
+
+Gin 的 `Context` 实现了 Go 标准库的 `context.Context` 接口，这意味着它可以直接用作上下文传递给各种 I/O 操作（如数据库查询、HTTP 请求等）。
+
+Gin Context 实现的 `context.Context` 方法：
+
+```go
+// Deadline 返回截止时间（如果有的话）
+func (c *Context) Deadline() (deadline time.Time, ok bool)
+
+// Done 返回一个 channel，当 context 被取消时会关闭
+func (c *Context) Done() <-chan struct{}
+
+// Err 返回 context 被取消的原因
+func (c *Context) Err() error
+
+// Value 返回与 key 关联的值
+func (c *Context) Value(key any) any
+```
+**源码位置**: [context.go:1446-1489](../context.go#L1446-L1489)
+
+### 6.5.2 hasRequestContext()：控制委托行为的关键
+
+Gin Context 的 `context.Context` 实现有一个特殊的控制机制——通过 `hasRequestContext()` 方法决定是否委托给底层的 `http.Request.Context()`。
+
+```go
+func (c *Context) hasRequestContext() bool {
+    hasFallback := c.engine != nil && c.engine.ContextWithFallback
+    hasRequestContext := c.Request != nil && c.Request.Context() != nil
+    return hasFallback && hasRequestContext
+}
+```
+**源码位置**: [context.go:1439-1444](../context.go#L1439-L1444)
+
+**关键点分析**：
+
+| 条件 | 说明 |
+|------|------|
+| `hasFallback` | 只有当 `engine.ContextWithFallback = true` 时才为 true |
+| `hasRequestContext` | `Request` 不为 nil 且 `Request.Context()` 不为 nil |
+| **返回值** | 只有两个条件都满足时才返回 true |
+
+**这意味着**：
+- **默认情况下**（`ContextWithFallback = false`），`hasRequestContext()` 永远返回 `false`
+- 只有显式开启 `ContextWithFallback` 后，才会委托给 `http.Request.Context()`
+
+### 6.5.3 默认行为：Context 不会被取消
+
+让我们看看 `Done()` 方法的实现：
+
+```go
+func (c *Context) Done() <-chan struct{} {
+    if !c.hasRequestContext() {
+        return nil
+    }
+    return c.Request.Context().Done()
+}
+```
+**源码位置**: [context.go:1455-1459](../context.go#L1455-L1459)
+
+**默认行为（ContextWithFallback = false）**：
+
+| 方法 | 返回值 | 含义 |
+|------|--------|------|
+| `Done()` | `nil` | 返回一个永远不会关闭的 channel |
+| `Err()` | `nil` | 没有错误 |
+| `Deadline()` | `(zero, false)` | 没有截止时间 |
+
+**这意味着**：
+- 默认情况下，Gin Context **不会** 被 `http.Request` 的取消信号影响
+- 即使客户端断开连接，`copiedCtx.Done()` 仍然返回 `nil`
+- 这就是 `TestContextCopyShouldNotCancel` 测试能够通过的原因
+
+### 6.5.4 开启 ContextWithFallback 后的行为
+
+当显式设置 `engine.ContextWithFallback = true` 时：
+
+```go
+// 开启 ContextWithFallback
+r := gin.New()
+r.ContextWithFallback = true
+```
+
+此时 `hasRequestContext()` 返回 `true`，Gin Context 的行为变为：
+
+| 方法 | 行为 |
+|------|------|
+| `Done()` | 返回 `c.Request.Context().Done()` |
+| `Err()` | 返回 `c.Request.Context().Err()` |
+| `Deadline()` | 返回 `c.Request.Context().Deadline()` |
+| `Value()` | 先查 `c.Keys`，再查 `c.Request.Context().Value()` |
+
+**这意味着**：
+- 当客户端断开连接时，`c.Done()` 返回的 channel 会被关闭
+- `c.Err()` 会返回 `context.Canceled`
+- 任何使用这个 Context 的 I/O 操作都会被取消
+
+### 6.5.5 http.Request.Context() 的取消信号来源
+
+在 Go 的 `net/http` 中，`http.Request.Context()` 的取消信号来自以下几种情况：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    客户端                                          │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          │ 1. 客户端断开连接（Close）
+                          │ 2. 客户端超时（Timeout）
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    net/http 服务器                                  │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ 当检测到断开时：                                               │ │
+│  │ - 调用 request.Context() 的 cancel 函数                        │ │
+│  │ - request.Context().Done() channel 被关闭                     │ │
+│  │ - request.Context().Err() 返回 context.Canceled               │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**具体触发场景**：
+
+| 场景 | 说明 |
+|------|------|
+| **客户端主动断开** | 用户关闭浏览器、网络中断、调用 `Close()` |
+| **请求超时** | 使用 `http.TimeoutHandler` 或设置了读写超时 |
+| **服务器主动取消** | 处理函数中手动取消 |
+
+### 6.5.6 c.Copy() 后的行为变化
+
+现在让我们分析 `c.Copy()` 后，取消信号的传播行为。
+
+首先看 `Copy()` 方法中对 `Request` 的处理：
+
+```go
+func (c *Context) Copy() *Context {
+    cp := Context{
+        writermem: c.writermem,
+        Request:   c.Request,    // ⚠️ 浅拷贝！共享同一个指针！
+        engine:    c.engine,     // ⚠️ 浅拷贝！共享同一个指针！
+    }
+    // ... 其他处理
+    return &cp
+}
+```
+**源码位置**: [context.go:375-379](../context.go#L375-L379)
+
+**关键发现**：
+- `Request` 是**浅拷贝**，复制的 Context 和原始 Context **共享同一个 `*http.Request` 指针**
+- `engine` 也是**浅拷贝**，共享同一个 `*Engine` 指针
+
+**这导致的行为差异**：
+
+| 配置 | copiedCtx 行为 |
+|------|----------------|
+| `ContextWithFallback = false`（默认） | `copiedCtx.Done()` 返回 `nil`，**不会被取消** |
+| `ContextWithFallback = true` | `copiedCtx.Done()` 返回 `copiedCtx.Request.Context().Done()`，**会被取消** |
+
+### 6.5.7 关键区别：copiedCtx vs copiedCtx.Request.Context()
+
+这是用户问题的核心！让我们分析两种使用方式的区别：
+
+#### 场景 A：使用 copiedCtx 作为上下文
+
+```go
+cp := c.Copy()
+go func() {
+    // 使用复制的 Context 发起 HTTP 请求
+    req, err := http.NewRequestWithContext(cp, "GET", downstreamURL, nil)
+    resp, err := http.DefaultClient.Do(req)
+    // ...
+}()
+```
+
+**行为分析**：
+
+| 配置 | 取消行为 |
+|------|----------|
+| `ContextWithFallback = false`（默认） | ❌ **不会被取消**。`cp.Done()` 返回 `nil`，即使原始请求断开，下游请求也会继续执行 |
+| `ContextWithFallback = true` | ✅ **会被取消**。`cp.Done()` 返回 `cp.Request.Context().Done()`，原始请求断开时下游请求会被取消 |
+
+#### 场景 B：使用 copiedCtx.Request.Context() 作为上下文
+
+```go
+cp := c.Copy()
+go func() {
+    // ⚠️ 直接使用 Request.Context()
+    req, err := http.NewRequestWithContext(cp.Request.Context(), "GET", downstreamURL, nil)
+    resp, err := http.DefaultClient.Do(req)
+    // ...
+}()
+```
+
+**行为分析**：
+
+| 配置 | 取消行为 |
+|------|----------|
+| `ContextWithFallback = false`（默认） | ✅ **会被取消**。直接使用 `cp.Request.Context()`，绕过了 Gin 的 `hasRequestContext()` 检查 |
+| `ContextWithFallback = true` | ✅ **会被取消**。同样使用原始请求的 Context |
+
+**这就是用户描述的问题场景**：
+> 当 goroutine 用 `copiedCtx.Request.Context()` 作为上下文去做数据库查询或下游 HTTP 请求时，如果客户端原始请求已断开，这个 context 会被取消
+
+**原因**：
+- 无论 `ContextWithFallback` 如何配置
+- `copiedCtx.Request` 与原始 Context 共享同一个 `*http.Request` 指针
+- `copiedCtx.Request.Context()` 直接返回原始请求的 Context
+- 当客户端断开时，这个 Context 会被取消
+
+### 6.5.8 TestContextCopyShouldNotCancel 测试用例深度解析
+
+让我们重新审视这个测试用例，理解它到底在验证什么：
+
+```go
+func TestContextCopyShouldNotCancel(t *testing.T) {
+    // 1. 创建一个下游服务器
+    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+        w.WriteHeader(http.StatusOK)
+    }))
+    defer srv.Close()
+
+    ensureRequestIsOver := make(chan struct{})
+    wg := &sync.WaitGroup{}
+
+    // 2. 创建 Gin 服务器（默认 ContextWithFallback = false）
+    r := New()
+    r.GET("/", func(ginctx *Context) {
+        wg.Add(1)
+
+        // 3. 复制 Context
+        ginctx = ginctx.Copy()
+
+        // 4. 启动异步 goroutine
+        go func() {
+            defer wg.Done()
+
+            // 5. 等待原始请求完成
+            <-ensureRequestIsOver
+
+            // 6. 使用复制的 Context 发起下游请求
+            req, err := http.NewRequestWithContext(ginctx, http.MethodGet, srv.URL, nil)
+            must(err)
+
+            res, err := http.DefaultClient.Do(req)
+            if err != nil {
+                t.Error(fmt.Errorf("request error: %w", err))
+                return
+            }
+
+            if res.StatusCode != http.StatusOK {
+                t.Error(fmt.Errorf("unexpected status code: %s", res.Status))
+            }
+        }()
+    })
+
+    // ... 启动服务器并发送请求
+
+    // 7. 原始请求完成
+    res, err := http.Get(...)
+    
+    // 8. 通知异步 goroutine 原始请求已完成
+    close(ensureRequestIsOver)
+
+    // 9. 等待异步 goroutine 完成
+    wg.Wait()
+}
+```
+**源码位置**: [context_test.go:3280-3342](../context_test.go#L3280-L3342)
+
+**测试验证的内容**：
+
+| 步骤 | 验证点 |
+|------|--------|
+| 3 | 使用 `c.Copy()` 复制 Context |
+| 5 | 等待 `ensureRequestIsOver`，确保**原始请求已完成** |
+| 6 | 使用 `ginctx`（复制的 Context）发起下游请求 |
+| 9 | 期望下游请求**能够成功完成**，不被取消 |
+
+**测试的假设**：
+- 默认 `ContextWithFallback = false`
+- 即使原始请求完成，复制的 Context 仍然有效
+- 下游请求不会被取消
+
+### 6.5.9 风险总结矩阵
+
+让我们用一个矩阵来总结不同使用方式的风险：
+
+| 使用方式 | ContextWithFallback = false（默认） | ContextWithFallback = true |
+|----------|-------------------------------------|----------------------------|
+| **原始 c（不推荐）** | 可能被重置/污染 ⚠️ | 可能被重置/污染 ⚠️ + 会被取消 |
+| **copiedCtx（场景 A）** | ✅ 安全，不会被取消 | ⚠️ 会被原始请求取消 |
+| **copiedCtx.Request.Context()（场景 B）** | ⚠️ 会被原始请求取消 | ⚠️ 会被原始请求取消 |
+| **提取值 + 独立 context（推荐）** | ✅ 完全可控 | ✅ 完全可控 |
+
+### 6.5.10 Goroutine 中正确的上下文处理模式
+
+#### 模式 1：使用 copiedCtx（默认行为，简单场景）
+
+适用于：希望异步操作**不被**客户端断开影响的场景
+
+```go
+router.GET("/api", func(c *gin.Context) {
+    // 提取需要的值
+    userID := c.GetUint64("user_id")
+    
+    // 复制 Context
+    cp := c.Copy()
+    
+    go func() {
+        // 使用复制的 Context
+        // 默认 ContextWithFallback = false，所以不会被取消
+        req, _ := http.NewRequestWithContext(cp, "GET", downstreamURL, nil)
+        resp, err := http.DefaultClient.Do(req)
+        // ...
+    }()
+    
+    c.JSON(200, gin.H{"status": "accepted"})
+})
+```
+
+**注意**：如果 `ContextWithFallback = true`，这种方式仍然会被取消。
+
+#### 模式 2：创建独立的 Context（推荐用于重要异步任务）
+
+适用于：希望完全控制异步任务的生命周期，**不希望**被客户端断开影响
+
+```go
+router.GET("/api", func(c *gin.Context) {
+    // 提取需要的值
+    userID := c.GetUint64("user_id")
+    traceID := c.GetHeader("X-Trace-ID")
+    
+    go func() {
+        // 创建独立的 context，带有自己的超时
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        
+        // 如果需要传递 traceID 等值，可以手动设置
+        // 或者使用自定义的 context 包装器
+        
+        // 数据库查询 - 使用独立的 context
+        err := db.ExecContext(ctx, "INSERT INTO tasks ...", userID)
+        if err != nil {
+            log.Printf("task failed: %v", err)
+            return
+        }
+        
+        // 下游 HTTP 请求 - 使用独立的 context
+        req, _ := http.NewRequestWithContext(ctx, "POST", notificationURL, nil)
+        http.DefaultClient.Do(req)
+    }()
+    
+    c.JSON(200, gin.H{"status": "accepted"})
+})
+```
+
+**优点**：
+- 完全控制异步任务的生命周期
+- 不受客户端断开的影响
+- 可以设置独立的超时时间
+
+#### 模式 3：继承值但不继承取消（高级模式）
+
+适用于：希望继承原始 Context 的值（如 traceID、logger 等），但**不希望**继承取消信号
+
+```go
+// 自定义 Context 包装器，继承值但不继承取消
+type valueOnlyContext struct {
+    context.Context
+    valuesCtx context.Context
+}
+
+func (c *valueOnlyContext) Value(key any) any {
+    // 先查原始 Context 的值
+    if val := c.valuesCtx.Value(key); val != nil {
+        return val
+    }
+    // 再查父 Context（如果有的话）
+    return c.Context.Value(key)
+}
+
+func (c *valueOnlyContext) Done() <-chan struct{} {
+    return nil // 永远不会被取消
+}
+
+func (c *valueOnlyContext) Err() error {
+    return nil
+}
+
+func (c *valueOnlyContext) Deadline() (time.Time, bool) {
+    return time.Time{}, false
+}
+
+// 使用示例
+router.GET("/api", func(c *gin.Context) {
+    cp := c.Copy()
+    
+    go func() {
+        // 创建一个继承值但不继承取消的 context
+        ctx := &valueOnlyContext{
+            Context:   context.Background(),
+            valuesCtx: cp, // 从复制的 Context 继承值
+        }
+        
+        // 可以设置独立的超时
+        ctxWithTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
+        defer cancel()
+        
+        // 使用这个 context
+        req, _ := http.NewRequestWithContext(ctxWithTimeout, "GET", downstreamURL, nil)
+        // ...
+    }()
+    
+    c.JSON(200, gin.H{"status": "accepted"})
+})
+```
+
+#### 模式 4：如果确实需要跟随原始请求取消
+
+适用于：希望异步操作**跟随**原始请求的生命周期，客户端断开时也取消异步操作
+
+```go
+router.GET("/api", func(c *gin.Context) {
+    // 方式 A：使用 c 本身（只在请求范围内有效）
+    // 注意：不要在异步 goroutine 中使用原始 c
+    
+    // 方式 B：开启 ContextWithFallback 后使用 copiedCtx
+    // 需要在 Engine 初始化时设置：
+    // r := gin.New()
+    // r.ContextWithFallback = true
+    
+    cp := c.Copy()
+    
+    go func() {
+        // 此时 copiedCtx.Done() 会返回原始请求的 Done channel
+        // 当客户端断开时，下游请求会被取消
+        req, _ := http.NewRequestWithContext(cp, "GET", downstreamURL, nil)
+        resp, err := http.DefaultClient.Do(req)
+        if err != nil {
+            // 可能是 context.Canceled
+            log.Printf("request failed: %v", err)
+            return
+        }
+        // ...
+    }()
+    
+    c.JSON(200, gin.H{"status": "processing"})
+})
+```
+
+### 6.5.11 最佳实践建议
+
+| 场景 | 推荐做法 | 不推荐做法 |
+|------|----------|------------|
+| 异步任务不应被客户端断开影响 | 使用独立的 `context.Background()` 或 `context.WithTimeout()` | 使用 `copiedCtx.Request.Context()` |
+| 需要继承原始 Context 的值 | 提取值后手动传递，或使用自定义 value-only context | 直接依赖 `Context.Value()` 传递 |
+| 希望异步任务跟随原始请求 | 开启 `ContextWithFallback` 后使用 `copiedCtx` | 使用原始 `c`（会被重置） |
+| 简单的异步任务（如日志、指标） | 使用 `copiedCtx`（默认行为） | - |
+
+### 6.5.12 关键点总结
+
+1. **Gin Context 默认不会被取消**
+   - `ContextWithFallback` 默认为 `false`
+   - `c.Done()` 返回 `nil`，永远不会被取消
+
+2. **`c.Copy()` 共享 Request 指针**
+   - 复制的 Context 与原始 Context **共享同一个 `*http.Request` 指针**
+   - 这是理解取消信号传播的关键
+
+3. **两种使用方式的关键区别**
+   - `copiedCtx`：受 `ContextWithFallback` 配置影响
+   - `copiedCtx.Request.Context()`：**直接使用原始请求的 Context，无论配置如何都会被取消**
+
+4. **用户问题的根本原因**
+   - 用户使用了 `copiedCtx.Request.Context()` 作为上下文
+   - 这绕过了 Gin 的 `hasRequestContext()` 检查
+   - 直接使用了原始请求的 Context，所以会被取消
+
+5. **推荐的做法**
+   - 对于不应被取消的异步任务：使用独立的 `context.Background()`
+   - 对于需要继承值的场景：提取值后手动传递，或使用自定义的 value-only context
+   - 避免使用 `copiedCtx.Request.Context()` 进行异步操作
+
+---
+
 ## 七、完整的生命周期流程图
 
 ```
